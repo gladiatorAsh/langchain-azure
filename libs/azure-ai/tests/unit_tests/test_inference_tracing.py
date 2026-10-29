@@ -8,6 +8,7 @@ from unittest.mock import patch
 from uuid import uuid4
 
 import pytest
+from pydantic import BaseModel
 
 # Skip tests cleanly if required deps are not present.
 # These guards must come *before* the optional imports below so that
@@ -947,9 +948,7 @@ def test_inference_span_records_gen_ai_semantic_attributes() -> None:
     assert attrs.get(tracing.Attrs.CONVERSATION_ID) == conversation_id
 
     assert json.loads(attrs[tracing.Attrs.REQUEST_STOP]) == ["stop"]
-    assert json.loads(attrs[tracing.Attrs.REQUEST_ENCODING_FORMATS]) == {
-        "type": "json_object"
-    }
+    assert tracing.Attrs.REQUEST_ENCODING_FORMATS not in attrs
     system_instr = json.loads(attrs[tracing.Attrs.SYSTEM_INSTRUCTIONS])
     assert system_instr[0]["content"] == "You are a helpful assistant."
     input_messages = json.loads(attrs[tracing.Attrs.INPUT_MESSAGES])
@@ -957,7 +956,7 @@ def test_inference_span_records_gen_ai_semantic_attributes() -> None:
     tool_defs = json.loads(attrs[tracing.Attrs.TOOL_DEFINITIONS])
     assert tool_defs[0]["function"]["name"] == "get_weather"
 
-    assert attrs.get(tracing.Attrs.OUTPUT_TYPE) == "text"
+    assert attrs.get(tracing.Attrs.OUTPUT_TYPE) == "json"
     output_messages = json.loads(attrs[tracing.Attrs.OUTPUT_MESSAGES])
     assert output_messages[0]["parts"][0]["content"] == "Here is a funny line."
     assert json.loads(attrs[tracing.Attrs.RESPONSE_FINISH_REASONS]) == ["stop"]
@@ -1044,6 +1043,7 @@ def test_streaming_token_event(monkeypatch: pytest.MonkeyPatch) -> None:
         tracing.Attrs.OPERATION_NAME: "text_completion",
         tracing.Attrs.REQUEST_MODEL: "m",
         tracing.Attrs.SERVER_ADDRESS: "example.openai.azure.com",
+        tracing.Attrs.SERVER_PORT: 443,
     }
 
 
@@ -1086,6 +1086,7 @@ def test_llm_end_records_gen_ai_client_metrics(
         tracing.Attrs.REQUEST_MODEL: "gpt-4o",
         tracing.Attrs.RESPONSE_MODEL: "gpt-4o-mini",
         tracing.Attrs.SERVER_ADDRESS: "example.openai.azure.com",
+        tracing.Attrs.SERVER_PORT: 443,
         tracing.Attrs.TOKEN_TYPE: "input",
     }
     assert token_usage.records[1][1] == {
@@ -1094,6 +1095,7 @@ def test_llm_end_records_gen_ai_client_metrics(
         tracing.Attrs.REQUEST_MODEL: "gpt-4o",
         tracing.Attrs.RESPONSE_MODEL: "gpt-4o-mini",
         tracing.Attrs.SERVER_ADDRESS: "example.openai.azure.com",
+        tracing.Attrs.SERVER_PORT: 443,
         tracing.Attrs.TOKEN_TYPE: "output",
     }
     assert len(duration.records) == 1
@@ -1104,6 +1106,7 @@ def test_llm_end_records_gen_ai_client_metrics(
         tracing.Attrs.REQUEST_MODEL: "gpt-4o",
         tracing.Attrs.RESPONSE_MODEL: "gpt-4o-mini",
         tracing.Attrs.SERVER_ADDRESS: "example.openai.azure.com",
+        tracing.Attrs.SERVER_PORT: 443,
     }
 
 
@@ -1145,6 +1148,7 @@ def test_streaming_metrics_record_subsequent_output_chunks(
         tracing.Attrs.OPERATION_NAME: "text_completion",
         tracing.Attrs.REQUEST_MODEL: "gpt-4o",
         tracing.Attrs.SERVER_ADDRESS: "example.openai.azure.com",
+        tracing.Attrs.SERVER_PORT: 443,
     }
     assert per_chunk.records[1][1] == per_chunk.records[0][1]
 
@@ -1213,6 +1217,7 @@ def test_llm_error_records_duration_metric_with_error_type(
         tracing.Attrs.OPERATION_NAME: "text_completion",
         tracing.Attrs.REQUEST_MODEL: "gpt-4o",
         tracing.Attrs.SERVER_ADDRESS: "example.openai.azure.com",
+        tracing.Attrs.SERVER_PORT: 443,
         tracing.Attrs.ERROR_TYPE: "ValueError",
     }
 
@@ -1682,7 +1687,7 @@ def test_server_port_extraction_variants(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     t = tracing.AzureAIOpenTelemetryTracer()
-    # https default port not set
+    # https default port recorded when the address is known
     run1 = uuid4()
     prompts = cast(List[str], [{"role": "user", "content": "hi"}])
     t.on_llm_start(
@@ -1692,7 +1697,7 @@ def test_server_port_extraction_variants(
         invocation_params={"model": "m"},
     )
     s1 = get_last_span_for(t)
-    assert tracing.Attrs.SERVER_PORT not in s1.attributes
+    assert s1.attributes.get(tracing.Attrs.SERVER_PORT) == 443
     # https non-default port set
     run2 = uuid4()
     t.on_llm_start(
@@ -1703,7 +1708,7 @@ def test_server_port_extraction_variants(
     )
     s2 = get_last_span_for(t)
     assert s2.attributes.get(tracing.Attrs.SERVER_PORT) == 8443
-    # http default port omitted
+    # http default port recorded when the address is known
     run3 = uuid4()
     t.on_llm_start(
         {"kwargs": {"model": "m", "azure_endpoint": "http://host"}},
@@ -1712,7 +1717,7 @@ def test_server_port_extraction_variants(
         invocation_params={"model": "m"},
     )
     s3 = get_last_span_for(t)
-    assert tracing.Attrs.SERVER_PORT not in s3.attributes
+    assert s3.attributes.get(tracing.Attrs.SERVER_PORT) == 80
     # http non-default port set
     run4 = uuid4()
     t.on_llm_start(
@@ -2252,6 +2257,57 @@ def test_provider_and_server_inference_helpers_cover_variants() -> None:
     )
     assert tracing._infer_server_address(None, None) is None
     assert tracing._infer_server_port(None, None) is None
+
+
+@pytest.mark.parametrize(
+    ("base_url", "expected"),
+    [
+        ("https://workspace.openai.azure.com", 443),
+        ("https://workspace.openai.azure.com/openai/v1", 443),
+        ("http://localhost/v1", 80),
+        ("https://workspace.openai.azure.com:8443", 8443),
+        ("grpc://host", None),
+        ("not-a-url", None),
+    ],
+)
+def test_infer_server_port_uses_scheme_default(
+    base_url: str, expected: Optional[int]
+) -> None:
+    assert tracing._infer_server_port(None, {"base_url": base_url}) == expected
+
+
+class _Answer(BaseModel):
+    value: str
+
+
+@pytest.mark.parametrize(
+    ("response_format", "expected"),
+    [
+        ({"type": "json_object"}, "json"),
+        ({"type": "json_schema", "json_schema": {"name": "a", "schema": {}}}, "json"),
+        ({"type": "text"}, "text"),
+        (_Answer, "json"),
+    ],
+)
+def test_output_type_derived_from_request_response_format(
+    response_format: Any, expected: str
+) -> None:
+    tracer = tracing.AzureAIOpenTelemetryTracer()
+    run_id = uuid4()
+    tracer.on_llm_start(
+        {"kwargs": {"model": "m"}},
+        [{"role": "user", "content": "hi"}],
+        run_id=run_id,
+        invocation_params={"model": "m", "response_format": response_format},
+    )
+    generation = ChatGeneration(
+        message=AIMessage(content='{"value": "42"}'),
+        generation_info={"finish_reason": "stop"},
+    )
+    tracer.on_llm_end(LLMResult(generations=[[generation]]), run_id=run_id)
+    attrs = get_last_span_for(tracer).attributes
+    assert attrs.get(tracing.Attrs.OUTPUT_TYPE) == expected
+    assert tracing.Attrs.REQUEST_ENCODING_FORMATS not in attrs
 
 
 def test_use_propagated_context_no_headers_is_noop(

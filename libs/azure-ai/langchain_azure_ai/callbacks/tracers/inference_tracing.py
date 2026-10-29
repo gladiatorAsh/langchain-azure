@@ -1187,6 +1187,9 @@ def _infer_server_address(
         return None
 
 
+_DEFAULT_PORTS = {"http": 80, "https": 443}
+
+
 def _infer_server_port(
     serialized: Optional[dict[str, Any]],
     invocation_params: Optional[dict[str, Any]],
@@ -1201,8 +1204,28 @@ def _infer_server_port(
         parsed = urlparse(base_url)
         if parsed.port:
             return parsed.port
+        if parsed.hostname:
+            return _DEFAULT_PORTS.get(parsed.scheme.lower())
     except Exception:  # pragma: no cover
         return None
+    return None
+
+
+def _output_type_from_response_format(response_format: Any) -> Optional[str]:
+    """Map a request ``response_format`` to a ``gen_ai.output.type`` value."""
+    if isinstance(response_format, type):
+        return "json"
+    format_type = (
+        response_format.get("type")
+        if isinstance(response_format, Mapping)
+        else response_format
+    )
+    if not isinstance(format_type, str):
+        return None
+    if format_type == "text":
+        return "text"
+    if format_type.startswith("json"):
+        return "json"
     return None
 
 
@@ -2251,6 +2274,7 @@ class AzureAIOpenTelemetryTracer(BaseCallbackHandler):
             )
             if formatted:
                 record.span.set_attribute(Attrs.OUTPUT_MESSAGES, formatted)
+            if formatted and Attrs.OUTPUT_TYPE not in record.attributes:
                 output_type = "text"
                 try:
                     parsed = json.loads(formatted)
@@ -2878,10 +2902,11 @@ class AzureAIOpenTelemetryTracer(BaseCallbackHandler):
             attributes[Attrs.REQUEST_STOP] = _as_json_attribute(
                 invocation_params["stop"]
             )
-        if invocation_params.get("response_format"):
-            attributes[Attrs.REQUEST_ENCODING_FORMATS] = _as_json_attribute(
-                invocation_params["response_format"]
-            )
+        requested_output_type = _output_type_from_response_format(
+            invocation_params.get("response_format")
+        )
+        if requested_output_type:
+            attributes[Attrs.OUTPUT_TYPE] = requested_output_type
 
         formatted_input, system_instr = self._prepare_messages_fn(
             inputs,
